@@ -119,13 +119,12 @@ The preprocessing pipeline requires the following atlas files placed in the `atl
 
 These files are available from [FSL](https://fsl.fmrib.ox.ac.uk/). See [`atlases/README.md`](atlases/README.md) for details.
 
-> **No external tools required** — brain extraction and atlas registration are fully self-contained in Python (SimpleITK + ANTsPy). No FSL, BET, or ANTs binaries are needed.
 
 ## Citation
 
 If you use this code, please cite:
 
 ```
-[Citation placeholder — to be updated upon publication]
+Anonymized
 ```
 
