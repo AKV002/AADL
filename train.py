@@ -1,0 +1,10 @@
+torch>=2.0
+monai>=1.3
+numpy
+nibabel
+SimpleITK
+antspyx
+matplotlib
+scikit-learn
+scipy
+pandas
