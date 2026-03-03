@@ -1,17 +1,20 @@
 """
-Evaluation script for the AADL neuroprognostication model.
+GradCAM++ explainability script for the AADL neuroprognostication model.
 
-Computes: Loss, Accuracy, Balanced Accuracy, Sensitivity, Specificity,
-          Precision, F1, AUC, PPV, NPV.
-Generates: confusion matrix plot, attention map visualizations, metrics.npz.
+Generates per-case combined saliency maps from three feature branches:
+  - Backbone  : norm5
+  - Att3      : norm_att3
+  - Att4      : att4.W
+
+Outputs are organized into TP / TN / FP / FN folders.
 
 Usage:
-    python evaluate.py \\
+    python explainability.py \\
         --model_path outputs/run1/best_model_loss.pth \\
         --data_dir data/split \\
         --split test \\
-        --batch_size 2 \\
-        --output_dir outputs/run1/eval
+        --class_idx 1 \\
+        --output_dir outputs/run1/gradcam
 """
 
 import argparse
@@ -22,161 +25,193 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    roc_auc_score,
-)
+import torch.nn.functional as F
 
-from dataset import create_dataloader
+from dataset import create_dataloader, get_data_list
 from model import DenseNet121WithAtlasAttention
 
 
 # ---------------------------------------------------------------------------
-# Evaluation helpers
+# GradCAM++ implementation
 # ---------------------------------------------------------------------------
-def run_inference(model, loader, criterion, device):
-    """Run model over the full loader; return aggregated predictions and labels."""
-    model.eval()
-    total_loss, total = 0, 0
-    all_preds, all_probs, all_labels = [], [], []
-    all_att3, all_att4 = [], []
+class CombinedGradCAMpp3D:
+    """
+    GradCAM++ over three branches of DenseNet121WithAtlasAttention:
+      1. norm5        (backbone, n4 channels)
+      2. norm_att3    (atlas attention block 3, n3 channels)
+      3. att4.W       (atlas attention block 4, n4 channels)
 
-    with torch.no_grad():
-        for batch in loader:
-            images = batch["image"].to(device)
-            atlas = batch["atlas"].to(device)
-            labels = batch["label"].to(device)
+    The three feature maps are concatenated to form a 3072-channel combined
+    representation; GradCAM++ weights are computed over this tensor.
+    Per-branch saliency is obtained by splitting the combined map back into
+    the three channel groups.
 
-            outputs, att3, att4 = model(images, atlas)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item() * len(labels)
-            total += len(labels)
+    Activations are captured via forward hooks; gradients are captured via
+    full_backward hooks — a single backward pass is sufficient.
+    """
 
-            probs = torch.softmax(outputs, dim=1)[:, 1]
-            preds = outputs.argmax(1)
+    def __init__(self, model):
+        self.model = model
+        self.hooks = []
+        self._activations = {}
+        self._gradients = {}
 
-            all_preds.extend(preds.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_att3.append(att3.cpu())
-            all_att4.append(att4.cpu())
+        for name, module in [
+            ("norm5", model.norm5),
+            ("norm_att3", model.norm_att3),
+            ("att4_W", model.att4.W),
+        ]:
+            self.hooks.append(module.register_forward_hook(self._make_act_hook(name)))
+            self.hooks.append(module.register_full_backward_hook(self._make_grad_hook(name)))
 
-    return (
-        total_loss / total,
-        np.array(all_labels),
-        np.array(all_preds),
-        np.array(all_probs),
-        torch.cat(all_att3, dim=0),
-        torch.cat(all_att4, dim=0),
+    def _make_act_hook(self, name):
+        def hook(module, input, output):
+            self._activations[name] = output.detach()
+        return hook
+
+    def _make_grad_hook(self, name):
+        def hook(module, grad_input, grad_output):
+            # grad_output[0] is the gradient of the loss w.r.t. the module output
+            self._gradients[name] = grad_output[0].detach()
+        return hook
+
+    def _compute_gradcampp(self, activations, grads):
+        """Compute GradCAM++ saliency map from activations and gradients."""
+        grads_sq = grads ** 2
+        grads_cub = grads ** 3
+        # Sum activations over spatial dims for denominator
+        spatial_sum = activations.sum(dim=(2, 3, 4), keepdim=True)
+        denom = 2 * grads_sq + grads_cub * spatial_sum
+        denom = torch.where(denom != 0, denom, torch.ones_like(denom))
+        alpha = grads_sq / denom
+        # Weighted combination
+        weights = (alpha * F.relu(grads)).sum(dim=(2, 3, 4), keepdim=True)
+        cam = (weights * activations).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        return cam
+
+    def compute(self, ct, atlas, class_idx):
+        """
+        Run a forward + backward pass and return saliency maps.
+
+        Args:
+            ct:        Tensor (B, 1, H, W, D)
+            atlas:     Tensor (B, 1, H, W, D)
+            class_idx: Class index to explain (0=good, 1=poor)
+
+        Returns dict with keys:
+            combined, backbone, att3, att4  — each a numpy array (H, W, D)
+        """
+        self.model.eval()
+        self._activations.clear()
+        self._gradients.clear()
+
+        logits, att3_map, att4_map = self.model(ct, atlas)
+        score = logits[0, class_idx]
+        self.model.zero_grad()
+        # Single backward pass — activations captured in forward hooks,
+        # gradients captured in full_backward hooks registered at __init__.
+        score.backward()
+
+        ref_size = self._activations["norm5"].shape[2:]
+
+        saliencies = {}
+        for key in ("norm5", "norm_att3", "att4_W"):
+            act = self._activations[key]
+            grad = self._gradients.get(key, torch.zeros_like(act))
+            cam = self._compute_gradcampp(act, grad)
+            cam_up = F.interpolate(cam, size=ref_size, mode="trilinear", align_corners=False)
+            saliencies[key] = cam_up
+
+        combined = sum(saliencies.values())
+        combined_np = combined[0, 0].cpu().numpy()
+        combined_np = (combined_np - combined_np.min()) / (combined_np.max() - combined_np.min() + 1e-8)
+
+        def _norm(t):
+            a = t[0, 0].cpu().numpy()
+            return (a - a.min()) / (a.max() - a.min() + 1e-8)
+
+        return {
+            "combined": combined_np,
+            "backbone": _norm(saliencies["norm5"]),
+            "att3": _norm(saliencies["norm_att3"]),
+            "att4": _norm(saliencies["att4_W"]),
+            "att3_map": att3_map[0, 0].detach().cpu().numpy(),
+            "att4_map": att4_map[0, 0].detach().cpu().numpy(),
+        }
+
+    def remove_hooks(self):
+        for h in self.hooks:
+            h.remove()
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def plot_case(ct_np, saliency, patient_id, label, pred, output_path):
+    """
+    Plot mid-slice views of CT + four saliency branches + attention maps.
+
+    Rows: combined | backbone | att3 | att4 | att3_map | att4_map
+    """
+    z_mid = ct_np.shape[-1] // 2
+
+    def sl(arr):
+        if arr.ndim == 3:
+            return arr[:, :, z_mid].T
+        return arr.T
+
+    rows = [
+        ("CT", sl(ct_np), "gray"),
+        ("Combined", sl(saliency["combined"]), "hot"),
+        ("Backbone", sl(saliency["backbone"]), "hot"),
+        ("Att3", sl(saliency["att3"]), "hot"),
+        ("Att4", sl(saliency["att4"]), "hot"),
+        ("Att3 map", sl(saliency["att3_map"]), "viridis"),
+        ("Att4 map", sl(saliency["att4_map"]), "viridis"),
+    ]
+
+    fig, axes = plt.subplots(1, len(rows), figsize=(4 * len(rows), 4))
+    for ax, (title, img, cmap) in zip(axes, rows):
+        ax.imshow(img, cmap=cmap, origin="lower")
+        ax.set_title(title, fontsize=9)
+        ax.axis("off")
+
+    fig.suptitle(
+        f"{patient_id} | True={'Good' if label == 0 else 'Poor'} "
+        f"Pred={'Good' if pred == 0 else 'Poor'}",
+        fontsize=10,
     )
-
-
-def compute_metrics(labels, preds, probs):
-    """Compute classification metrics and return as a dict."""
-    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
-    try:
-        auc = roc_auc_score(labels, probs)
-    except ValueError:
-        auc = 0.0
-    return {
-        "accuracy": accuracy_score(labels, preds),
-        "balanced_accuracy": balanced_accuracy_score(labels, preds),
-        "sensitivity": sensitivity,
-        "specificity": specificity,
-        "precision": precision_score(labels, preds, zero_division=0),
-        "f1": f1_score(labels, preds, zero_division=0),
-        "auc": auc,
-        "ppv": ppv,
-        "npv": npv,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Plotting helpers
-# ---------------------------------------------------------------------------
-def plot_confusion_matrix(labels, preds, output_path):
-    cm = confusion_matrix(labels, preds, labels=[0, 1])
-    fig, ax = plt.subplots(figsize=(5, 4))
-    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-    plt.colorbar(im, ax=ax)
-    ax.set(
-        xticks=[0, 1],
-        yticks=[0, 1],
-        xticklabels=["Good", "Poor"],
-        yticklabels=["Good", "Poor"],
-        xlabel="Predicted",
-        ylabel="True",
-        title="Confusion Matrix",
-    )
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                    color="white" if cm[i, j] > cm.max() / 2 else "black")
     plt.tight_layout()
-    plt.savefig(output_path, dpi=100)
+    plt.savefig(output_path, dpi=80)
     plt.close(fig)
-
-
-def plot_attention_maps(cases, output_dir, title_prefix=""):
-    """
-    Plot attention maps for a list of cases.
-
-    Each case is a dict with keys: patient_id, att3 (tensor), att4 (tensor), label, pred.
-    """
-    for case in cases:
-        att3 = case["att3"].squeeze().numpy()
-        att4 = case["att4"].squeeze().numpy()
-        z_mid = att3.shape[-1] // 2 if att3.ndim == 3 else 0
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        for ax, att, name in zip(axes, [att3, att4], ["att3", "att4"]):
-            sl = att[:, :, z_mid] if att.ndim == 3 else att
-            ax.imshow(sl.T, cmap="hot", origin="lower")
-            ax.set_title(f"{name} (z={z_mid})")
-            ax.axis("off")
-        fig.suptitle(
-            f"{title_prefix}{case['patient_id']} | "
-            f"True={'Good' if case['label'] == 0 else 'Poor'} "
-            f"Pred={'Good' if case['pred'] == 0 else 'Poor'}"
-        )
-        plt.tight_layout()
-        plt.savefig(Path(output_dir) / f"{case['patient_id']}_attention.png", dpi=80)
-        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate the AADL neuroprognostication model.")
+    parser = argparse.ArgumentParser(description="GradCAM++ explainability for the AADL model.")
     parser.add_argument("--model_path", required=True, help="Path to model checkpoint (.pth)")
     parser.add_argument("--data_dir", required=True, help="Root data directory")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
-    parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--output_dir", required=True, help="Directory to save evaluation outputs")
+    parser.add_argument("--class_idx", type=int, default=1, help="Class index to explain (0=good, 1=poor)")
+    parser.add_argument("--output_dir", required=True, help="Directory to save GradCAM outputs")
     parser.add_argument("--target_shape", type=int, nargs=3, default=[128, 128, 64], metavar=("H", "W", "D"))
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    for folder in ("TP", "TN", "FP", "FN"):
+        (output_dir / folder).mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # --- Data ---
+    # --- Data (batch_size=1 for GradCAM) ---
     target_shape = tuple(args.target_shape)
     loader, data_list = create_dataloader(
-        args.data_dir, args.split, target_shape, args.batch_size,
-        augment=False, num_workers=4,
+        args.data_dir, args.split, target_shape, batch_size=1,
+        augment=False, num_workers=0,
     )
 
     # --- Model ---
@@ -185,50 +220,45 @@ def main():
     model.load_state_dict(state)
     print(f"Loaded model from {args.model_path}")
 
-    criterion = nn.CrossEntropyLoss()
+    cam = CombinedGradCAMpp3D(model)
 
-    # --- Inference ---
-    loss, labels, preds, probs, att3_maps, att4_maps = run_inference(model, loader, criterion, device)
+    summary = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
 
-    # --- Metrics ---
-    metrics = compute_metrics(labels, preds, probs)
-    metrics["loss"] = loss
+    for i, (batch, meta) in enumerate(zip(loader, data_list)):
+        ct = batch["image"].to(device)
+        atlas = batch["atlas"].to(device)
+        label = int(batch["label"].item())
 
-    print(f"\n{'='*50}")
-    print(f"Split: {args.split.upper()}")
-    print(f"{'='*50}")
-    for k, v in metrics.items():
-        print(f"  {k:<20s}: {v:.4f}")
+        saliency = cam.compute(ct, atlas, args.class_idx)
 
-    # --- Confusion matrix ---
-    plot_confusion_matrix(labels, preds, output_dir / "confusion_matrix.png")
+        with torch.no_grad():
+            logits, _, _ = model(ct, atlas)
+        pred = int(logits.argmax(1).item())
 
-    # --- Attention map visualizations: correct good, correct poor, misclassified ---
-    cases = []
-    for i, d in enumerate(data_list):
-        cases.append(
-            {
-                "patient_id": d["patient_id"],
-                "label": int(labels[i]),
-                "pred": int(preds[i]),
-                "att3": att3_maps[i],
-                "att4": att4_maps[i],
-            }
+        if label == 1 and pred == 1:
+            category = "TP"
+        elif label == 0 and pred == 0:
+            category = "TN"
+        elif label == 0 and pred == 1:
+            category = "FP"
+        else:
+            category = "FN"
+
+        summary[category] += 1
+        patient_id = meta["patient_id"]
+        ct_np = ct[0, 0].detach().cpu().numpy()
+
+        plot_case(
+            ct_np, saliency, patient_id, label, pred,
+            output_dir / category / f"{patient_id}.png",
         )
+        print(f"[{i+1}/{len(data_list)}] {patient_id}: label={label} pred={pred} → {category}")
 
-    def pick_one(condition):
-        return next((c for c in cases if condition(c)), None)
+    cam.remove_hooks()
 
-    representative = [
-        pick_one(lambda c: c["label"] == 0 and c["pred"] == 0),   # correct good
-        pick_one(lambda c: c["label"] == 1 and c["pred"] == 1),   # correct poor
-        pick_one(lambda c: c["label"] != c["pred"]),               # misclassified
-    ]
-    representative = [c for c in representative if c is not None]
-    plot_attention_maps(representative, output_dir, title_prefix="")
-
-    # --- Save metrics ---
-    np.savez(output_dir / "metrics.npz", **{k: np.array(v) for k, v in metrics.items()})
+    print("\n--- Summary ---")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
     print(f"\nOutputs saved to {output_dir}")
 
 
