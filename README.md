@@ -42,13 +42,13 @@ pip install -r requirements.txt
 
 ```
 data/
-├── raw/                        # Raw skull-stripped NIfTI CTs
+├── raw/                        # Raw Head CTs -->     This is out input data
 │   ├── patient_001/
 │   │   └── brain.nii.gz
 │   └── ...
 ├── processed/                  # Output of preprocessing.py
 │   ├── patient_001/
-│   │   ├── brain.nii.gz       # Cropped, HU-clipped brain
+│   │   ├── brain.nii.gz       # Skull-stripped Cropped, HU-clipped brain
 │   │   └── roi_mask.nii.gz    # Union of 4 ROI masks
 │   └── ...
 └── split/                      # Train/val/test splits for training
