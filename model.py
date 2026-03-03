@@ -1,266 +1,246 @@
 """
-GradCAM++ explainability script for the AADL neuroprognostication model.
-
-Generates per-case combined saliency maps from three feature branches:
-  - Backbone  : norm5
-  - Att3      : norm_att3
-  - Att4      : att4.W
-
-Outputs are organized into TP / TN / FP / FN folders.
-
-Usage:
-    python explainability.py \\
-        --model_path outputs/run1/best_model_loss.pth \\
-        --data_dir data/split \\
-        --split test \\
-        --class_idx 1 \\
-        --output_dir outputs/run1/gradcam
+3D DenseNet121 with Atlas-Guided Attention Gates
+MaxPool expansion + AvgPool downsampling for gating signal
 """
 
-import argparse
-from pathlib import Path
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-
-from dataset import create_dataloader, get_data_list
-from model import DenseNet121WithAtlasAttention
+from collections import OrderedDict
 
 
-# ---------------------------------------------------------------------------
-# GradCAM++ implementation
-# ---------------------------------------------------------------------------
-class CombinedGradCAMpp3D:
-    """
-    GradCAM++ over three branches of DenseNet121WithAtlasAttention:
-      1. norm5        (backbone, n4 channels)
-      2. norm_att3    (atlas attention block 3, n3 channels)
-      3. att4.W       (atlas attention block 4, n4 channels)
-
-    The three feature maps are concatenated to form a 3072-channel combined
-    representation; GradCAM++ weights are computed over this tensor.
-    Per-branch saliency is obtained by splitting the combined map back into
-    the three channel groups.
-
-    Activations are captured via forward hooks; gradients are captured via
-    full_backward hooks — a single backward pass is sufficient.
-    """
-
-    def __init__(self, model):
-        self.model = model
-        self.hooks = []
-        self._activations = {}
-        self._gradients = {}
-
-        for name, module in [
-            ("norm5", model.norm5),
-            ("norm_att3", model.norm_att3),
-            ("att4_W", model.att4.W),
-        ]:
-            self.hooks.append(module.register_forward_hook(self._make_act_hook(name)))
-            self.hooks.append(module.register_full_backward_hook(self._make_grad_hook(name)))
-
-    def _make_act_hook(self, name):
-        def hook(module, input, output):
-            self._activations[name] = output.detach()
-        return hook
-
-    def _make_grad_hook(self, name):
-        def hook(module, grad_input, grad_output):
-            # grad_output[0] is the gradient of the loss w.r.t. the module output
-            self._gradients[name] = grad_output[0].detach()
-        return hook
-
-    def _compute_gradcampp(self, activations, grads):
-        """Compute GradCAM++ saliency map from activations and gradients."""
-        grads_sq = grads ** 2
-        grads_cub = grads ** 3
-        # Sum activations over spatial dims for denominator
-        spatial_sum = activations.sum(dim=(2, 3, 4), keepdim=True)
-        denom = 2 * grads_sq + grads_cub * spatial_sum
-        denom = torch.where(denom != 0, denom, torch.ones_like(denom))
-        alpha = grads_sq / denom
-        # Weighted combination
-        weights = (alpha * F.relu(grads)).sum(dim=(2, 3, 4), keepdim=True)
-        cam = (weights * activations).sum(dim=1, keepdim=True)
-        cam = F.relu(cam)
-        return cam
-
-    def compute(self, ct, atlas, class_idx):
-        """
-        Run a forward + backward pass and return saliency maps.
-
-        Args:
-            ct:        Tensor (B, 1, H, W, D)
-            atlas:     Tensor (B, 1, H, W, D)
-            class_idx: Class index to explain (0=good, 1=poor)
-
-        Returns dict with keys:
-            combined, backbone, att3, att4  — each a numpy array (H, W, D)
-        """
-        self.model.eval()
-        self._activations.clear()
-        self._gradients.clear()
-
-        logits, att3_map, att4_map = self.model(ct, atlas)
-        score = logits[0, class_idx]
-        self.model.zero_grad()
-        # Single backward pass — activations captured in forward hooks,
-        # gradients captured in full_backward hooks registered at __init__.
-        score.backward()
-
-        ref_size = self._activations["norm5"].shape[2:]
-
-        saliencies = {}
-        for key in ("norm5", "norm_att3", "att4_W"):
-            act = self._activations[key]
-            grad = self._gradients.get(key, torch.zeros_like(act))
-            cam = self._compute_gradcampp(act, grad)
-            cam_up = F.interpolate(cam, size=ref_size, mode="trilinear", align_corners=False)
-            saliencies[key] = cam_up
-
-        combined = sum(saliencies.values())
-        combined_np = combined[0, 0].cpu().numpy()
-        combined_np = (combined_np - combined_np.min()) / (combined_np.max() - combined_np.min() + 1e-8)
-
-        def _norm(t):
-            a = t[0, 0].cpu().numpy()
-            return (a - a.min()) / (a.max() - a.min() + 1e-8)
-
-        return {
-            "combined": combined_np,
-            "backbone": _norm(saliencies["norm5"]),
-            "att3": _norm(saliencies["norm_att3"]),
-            "att4": _norm(saliencies["att4_W"]),
-            "att3_map": att3_map[0, 0].detach().cpu().numpy(),
-            "att4_map": att4_map[0, 0].detach().cpu().numpy(),
-        }
-
-    def remove_hooks(self):
-        for h in self.hooks:
-            h.remove()
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-def plot_case(ct_np, saliency, patient_id, label, pred, output_path):
-    """
-    Plot mid-slice views of CT + four saliency branches + attention maps.
-
-    Rows: combined | backbone | att3 | att4 | att3_map | att4_map
-    """
-    z_mid = ct_np.shape[-1] // 2
-
-    def sl(arr):
-        if arr.ndim == 3:
-            return arr[:, :, z_mid].T
-        return arr.T
-
-    rows = [
-        ("CT", sl(ct_np), "gray"),
-        ("Combined", sl(saliency["combined"]), "hot"),
-        ("Backbone", sl(saliency["backbone"]), "hot"),
-        ("Att3", sl(saliency["att3"]), "hot"),
-        ("Att4", sl(saliency["att4"]), "hot"),
-        ("Att3 map", sl(saliency["att3_map"]), "viridis"),
-        ("Att4 map", sl(saliency["att4_map"]), "viridis"),
-    ]
-
-    fig, axes = plt.subplots(1, len(rows), figsize=(4 * len(rows), 4))
-    for ax, (title, img, cmap) in zip(axes, rows):
-        ax.imshow(img, cmap=cmap, origin="lower")
-        ax.set_title(title, fontsize=9)
-        ax.axis("off")
-
-    fig.suptitle(
-        f"{patient_id} | True={'Good' if label == 0 else 'Poor'} "
-        f"Pred={'Good' if pred == 0 else 'Poor'}",
-        fontsize=10,
-    )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=80)
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="GradCAM++ explainability for the AADL model.")
-    parser.add_argument("--model_path", required=True, help="Path to model checkpoint (.pth)")
-    parser.add_argument("--data_dir", required=True, help="Root data directory")
-    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
-    parser.add_argument("--class_idx", type=int, default=1, help="Class index to explain (0=good, 1=poor)")
-    parser.add_argument("--output_dir", required=True, help="Directory to save GradCAM outputs")
-    parser.add_argument("--target_shape", type=int, nargs=3, default=[128, 128, 64], metavar=("H", "W", "D"))
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    for folder in ("TP", "TN", "FP", "FN"):
-        (output_dir / folder).mkdir(parents=True, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    # --- Data (batch_size=1 for GradCAM) ---
-    target_shape = tuple(args.target_shape)
-    loader, data_list = create_dataloader(
-        args.data_dir, args.split, target_shape, batch_size=1,
-        augment=False, num_workers=0,
-    )
-
-    # --- Model ---
-    model = DenseNet121WithAtlasAttention(in_channels=1, atlas_channels=1, out_channels=2).to(device)
-    state = torch.load(args.model_path, map_location=device)
-    model.load_state_dict(state)
-    print(f"Loaded model from {args.model_path}")
-
-    cam = CombinedGradCAMpp3D(model)
-
-    summary = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
-
-    for i, (batch, meta) in enumerate(zip(loader, data_list)):
-        ct = batch["image"].to(device)
-        atlas = batch["atlas"].to(device)
-        label = int(batch["label"].item())
-
-        saliency = cam.compute(ct, atlas, args.class_idx)
-
-        with torch.no_grad():
-            logits, _, _ = model(ct, atlas)
-        pred = int(logits.argmax(1).item())
-
-        if label == 1 and pred == 1:
-            category = "TP"
-        elif label == 0 and pred == 0:
-            category = "TN"
-        elif label == 0 and pred == 1:
-            category = "FP"
-        else:
-            category = "FN"
-
-        summary[category] += 1
-        patient_id = meta["patient_id"]
-        ct_np = ct[0, 0].detach().cpu().numpy()
-
-        plot_case(
-            ct_np, saliency, patient_id, label, pred,
-            output_dir / category / f"{patient_id}.png",
+class _DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate, bn_size, dropout_prob):
+        super().__init__()
+        mid = bn_size * growth_rate
+        self.layers = nn.Sequential(
+            nn.BatchNorm3d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(in_channels, mid, kernel_size=1, bias=False),
+            nn.BatchNorm3d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid, growth_rate, kernel_size=3, padding=(1, 3, 3), dilation=(1, 3, 3), bias=False),
         )
-        print(f"[{i+1}/{len(data_list)}] {patient_id}: label={label} pred={pred} → {category}")
+        self.dropout = nn.Dropout3d(dropout_prob) if dropout_prob > 0 else None
 
-    cam.remove_hooks()
+    def forward(self, x):
+        out = self.layers(x)
+        if self.dropout:
+            out = self.dropout(out)
+        return torch.cat([x, out], 1)
 
-    print("\n--- Summary ---")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(f"\nOutputs saved to {output_dir}")
+
+class _DenseBlock(nn.Sequential):
+    def __init__(self, num_layers, in_channels, bn_size, growth_rate, dropout_prob):
+        super().__init__()
+        for i in range(num_layers):
+            self.add_module(
+                f"denselayer{i+1}",
+                _DenseLayer(in_channels + i * growth_rate, growth_rate, bn_size, dropout_prob),
+            )
+
+
+class _Transition(nn.Sequential):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.add_module("norm", nn.BatchNorm3d(in_channels))
+        self.add_module("relu", nn.ReLU(inplace=True))
+        self.add_module("conv", nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False))
+        self.add_module("pool", nn.AvgPool3d(kernel_size=2, stride=2))
+
+
+class MaxPoolExpand3D(nn.Module):
+    def __init__(self, kernel_size=3, iterations=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.iterations = iterations
+        self.padding = kernel_size // 2
+
+    def forward(self, x):
+        for _ in range(self.iterations):
+            x = F.max_pool3d(x, kernel_size=self.kernel_size, stride=1, padding=self.padding)
+        return x
+
+
+class AtlasAttentionGate3D(nn.Module):
+    def __init__(self, in_channels, atlas_channels=1, inter_channels=None):
+        super().__init__()
+        if inter_channels is None:
+            inter_channels = max(in_channels // 4, 1)
+
+        self.theta = nn.Conv3d(in_channels, inter_channels, kernel_size=2, stride=2, padding=0, bias=False)
+        self.phi = nn.Conv3d(atlas_channels, inter_channels, kernel_size=1, stride=1, padding=0, bias=True)
+        self.psi = nn.Conv3d(inter_channels, 1, kernel_size=1, stride=1, padding=0, bias=True)
+
+        self.W = nn.Sequential(
+            nn.Conv3d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm3d(in_channels),
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+        nn.init.constant_(self.psi.bias, 3.0)
+
+    def forward(self, x, atlas_expanded):
+        theta_x = self.theta(x)
+        target_size = theta_x.shape[2:]
+
+        g_down = F.adaptive_avg_pool3d(atlas_expanded, output_size=target_size)
+        phi_g = self.phi(g_down)
+
+        f = self.relu(theta_x + phi_g)
+        alpha_low = self.sigmoid(self.psi(f))
+        alpha = F.interpolate(alpha_low, size=x.shape[2:], mode="trilinear", align_corners=False)
+
+        y = alpha * x
+        out = self.W(y)
+        return out, alpha
+
+
+class DenseNet121WithAtlasAttention(nn.Module):
+    def __init__(
+        self,
+        in_channels=1,
+        atlas_channels=1,
+        out_channels=2,
+        init_features=64,
+        growth_rate=32,
+        block_config=(6, 12, 24, 16),
+        bn_size=4,
+        dropout_prob=0.0,
+        expand_kernel_size=3,
+        expand_iterations=1,
+    ):
+        super().__init__()
+
+        self.atlas_expander = MaxPoolExpand3D(
+            kernel_size=expand_kernel_size,
+            iterations=expand_iterations,
+        )
+
+        self.stem = nn.Sequential(OrderedDict([
+            ("conv0", nn.Conv3d(in_channels, init_features, kernel_size=(3, 7, 7), stride=2, padding=(1, 3, 3), bias=False)),
+            ("norm0", nn.BatchNorm3d(init_features)),
+            ("relu0", nn.ReLU(inplace=True)),
+            ("pool0", nn.MaxPool3d(kernel_size=3, stride=2, padding=1)),
+        ]))
+
+        n = init_features
+
+        self.denseblock1 = _DenseBlock(block_config[0], n, bn_size, growth_rate, dropout_prob)
+        n += block_config[0] * growth_rate
+        self.transition1 = _Transition(n, n // 2)
+        n //= 2
+
+        self.denseblock2 = _DenseBlock(block_config[1], n, bn_size, growth_rate, dropout_prob)
+        n += block_config[1] * growth_rate
+        self.transition2 = _Transition(n, n // 2)
+        n //= 2
+
+        self.denseblock3 = _DenseBlock(block_config[2], n, bn_size, growth_rate, dropout_prob)
+        n3 = n + block_config[2] * growth_rate
+        self.transition3 = _Transition(n3, n3 // 2)
+        n = n3 // 2
+
+        self.denseblock4 = _DenseBlock(block_config[3], n, bn_size, growth_rate, dropout_prob)
+        n4 = n + block_config[3] * growth_rate
+        self.norm5 = nn.BatchNorm3d(n4)
+
+        self.n3 = n3
+        self.n4 = n4
+
+        self.att3 = AtlasAttentionGate3D(in_channels=n3, atlas_channels=atlas_channels, inter_channels=max(n3 // 4, 1))
+        self.att4 = AtlasAttentionGate3D(in_channels=n4, atlas_channels=atlas_channels, inter_channels=max(n4 // 4, 1))
+
+        self.norm_att3 = nn.BatchNorm3d(n3)
+
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+
+        concat_dim = n4 + n3 + n4
+        self.classifier = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Linear(concat_dim, out_channels),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias, 0)
+
+        nn.init.constant_(self.att3.psi.bias, 3.0)
+        nn.init.constant_(self.att4.psi.bias, 3.0)
+
+    def forward(self, ct, atlas):
+        atlas = self.atlas_expander(atlas)
+
+        x = self.stem(ct)
+
+        x = self.denseblock1(x)
+        x = self.transition1(x)
+
+        x = self.denseblock2(x)
+        x = self.transition2(x)
+
+        x = self.denseblock3(x)
+        feat_db3 = x
+
+        x = self.transition3(x)
+
+        x = self.denseblock4(x)
+        x = self.norm5(x)
+        feat_db4 = x
+
+        y1, att3_map = self.att3(feat_db3, atlas)
+        y1 = self.norm_att3(y1)
+
+        y2, att4_map = self.att4(feat_db4, atlas)
+
+        feat_db4_pooled = self.global_pool(feat_db4).flatten(1)
+        y1_pooled = self.global_pool(y1).flatten(1)
+        y2_pooled = self.global_pool(y2).flatten(1)
+
+        concat_feat = torch.cat([feat_db4_pooled, y1_pooled, y2_pooled], dim=1)
+
+        logits = self.classifier(concat_feat)
+
+        return logits, att3_map, att4_map
 
 
 if __name__ == "__main__":
-    main()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = DenseNet121WithAtlasAttention(
+        in_channels=1,
+        atlas_channels=1,
+        out_channels=2,
+        dropout_prob=0,
+        expand_kernel_size=3,
+        expand_iterations=1,
+    ).to(device)
+
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    ct = torch.randn(1, 1, 256, 256, 64).to(device)
+    atlas = (torch.rand(1, 1, 256, 256, 64) > 0.5).float().to(device)
+
+    with torch.no_grad():
+        logits, att3, att4 = model(ct, atlas)
+        print(f"logits: {logits.shape}")
+        print(f"att3:   {att3.shape}")
+        print(f"att4:   {att4.shape}")
